@@ -1,5 +1,10 @@
 import torch
+import contextlib
 
+def safe_nvtx_range(name):
+    if hasattr(torch, "cuda") and torch.cuda.is_available():
+        return torch.cuda.nvtx.range(name)
+    return contextlib.nullcontext()
 
 def softmax(x, dim=-1):
     rescaled_input = x - torch.max(x, dim=dim, keepdim=True)[0]
