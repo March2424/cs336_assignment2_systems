@@ -64,7 +64,47 @@ class FlashAttentionV2Torch(torch.autograd.Function):
     @staticmethod
     @torch.compile(fullgraph=True)
     def backward(ctx, dO):
-        raise NotImplementedError
+        L, Q, K, V, O = ctx.saved_tensors
+        
+        # 1. 兼容性处理：如果输入是 4D (带有 Head 维度)，统一用 4D 的 einsum 表达式
+        has_head = (Q.dim() == 4)
+        if not has_head:
+            Q, K, V, O, dO, L = [x.unsqueeze(1) for x in (Q, K, V, O, dO, L)]
+
+        d = K.shape[-1]
+        
+        # 强制在 FP32 下进行数学计算以防溢出
+        Q_f, K_f, V_f, dO_f = Q.float(), K.float(), V.float(), dO.float()
+
+        # 2. 将 s1 换成 i，s2 换成 j，适配 torch.einsum 的单字母严格规范
+        S = torch.einsum("b h i d, b h j d -> b h i j", Q_f, K_f) / (d ** 0.5)
+        
+        if ctx.is_causal:
+            mask = torch.tril(torch.ones(S.shape[-2], S.shape[-1], device=S.device))
+            S = S.masked_fill(mask == 0, -torch.inf)
+            
+        P = torch.exp(S - L.unsqueeze(-1))
+        
+        # 防止 -inf - (-inf) 产生 NaN，必须强行清零
+        if ctx.is_causal:
+            P = P.masked_fill(mask == 0, 0.0)
+
+        # 同样将 s1, s2 替换为 i, j
+        dV = torch.einsum('b h i j, b h i d -> b h j d', P, dO_f)
+        dP = torch.einsum('b h j d, b h i d -> b h i j', V_f, dO_f)
+
+        D = (O.float() * dO_f).sum(dim=-1)
+        dS = P * (dP - D.unsqueeze(-1))
+
+        dQ = torch.einsum('b h i j, b h j d -> b h i d', dS, K_f) / (d ** 0.5)
+        dK = torch.einsum('b h i j, b h i d -> b h j d', dS, Q_f) / (d ** 0.5)
+
+        # 还原回 3D 形状 (如果需要)
+        if not has_head:
+            dQ, dK, dV = dQ.squeeze(1), dK.squeeze(1), dV.squeeze(1)
+
+        # 3. 将梯度的 dtype 转换回与输入 Q, K, V 相同的精度
+        return dQ.to(Q.dtype), dK.to(K.dtype), dV.to(V.dtype), None
 
 
 @triton.jit
@@ -211,7 +251,7 @@ class FlashAttentionV2Triton(torch.autograd.Function):
             is_causal=is_causal,
         )
 
-        ctx.save_for_backward(O, L, Q, K, V)
+        ctx.save_for_backward(L, Q, K, V, O)
         ctx.is_causal = is_causal
         return O
     
